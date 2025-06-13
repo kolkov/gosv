@@ -2,8 +2,12 @@ package supervisor
 
 import (
 	"fmt"
+	"log"
+	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/fatih/color"
@@ -12,6 +16,9 @@ import (
 	"github.com/kolkov/gosv/internal/process"
 	"github.com/rivo/tview"
 )
+
+// Вынесем ProcessInfo в отдельный файл или оставим здесь
+type ProcessInfo = process.ProcessInfo
 
 type Supervisor struct {
 	manager *process.Manager
@@ -251,7 +258,7 @@ func (s *Supervisor) RunTUI() {
 	// Создаем flex-контейнер с правильными пропорциями
 	flex := tview.NewFlex().
 		SetDirection(tview.FlexRow).
-		AddItem(table, 0, 3, true). // 3/4 экрана для таблицы
+		AddItem(table, 0, 3, true).   // 3/4 экрана для таблицы
 		AddItem(logView, 0, 1, false) // 1/4 экрана для логов
 
 	// Функция обновления таблицы
@@ -394,4 +401,16 @@ func formatUptime(d time.Duration) string {
 		return fmt.Sprintf("%02dh%02dm", h, m)
 	}
 	return fmt.Sprintf("%02dm%02ds", m, s)
+}
+
+func (s *Supervisor) RunDaemon(grpcPort string) {
+	if err := s.StartAll(); err != nil {
+		log.Fatalf("[ERROR] Startup failed: %v", err)
+	}
+
+	// Основной цикл демона
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	<-sigCh
+	s.StopAll()
 }

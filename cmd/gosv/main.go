@@ -3,6 +3,8 @@ package main
 import (
 	"flag"
 	"fmt"
+	"github.com/kolkov/gosv/internal/api"
+	"github.com/kolkov/gosv/internal/service"
 	"log"
 	"os"
 	"os/signal"
@@ -14,6 +16,8 @@ import (
 	"github.com/kolkov/gosv/internal/process"
 	"github.com/kolkov/gosv/internal/supervisor"
 )
+
+var grpcPort string
 
 func ensureConfigExists(path string) error {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
@@ -45,6 +49,9 @@ func main() {
 	cfgPath := flag.String("c", "gsv.yaml", "Path to configuration file")
 	tuiMode := flag.Bool("tui", false, "Enable terminal UI mode")
 	debugMode := flag.Bool("debug", false, "Enable debug logging")
+	// Добавляем флаг для gRPC порта
+	grpcPort := flag.String("grpc-port", "", "gRPC server port (empty to disable)")
+	flag.Parse()
 
 	// Флаги управления процессами
 	startProc := flag.String("start", "", "Start specific process")
@@ -122,7 +129,7 @@ func main() {
 	}
 
 	// Стандартный режим работы
-	runSupervisor(sv, tuiMode, cfgPath)
+	runSupervisor(sv, tuiMode, cfgPath, *grpcPort)
 }
 
 func listAllProcesses(cfg *config.Config) {
@@ -195,12 +202,21 @@ func runProcessForeground(sv *supervisor.Supervisor, procName string) {
 	}
 }
 
-func runSupervisor(sv *supervisor.Supervisor, tuiMode *bool, cfgPath *string) {
+func runSupervisor(sv *supervisor.Supervisor, tuiMode *bool, cfgPath *string, grpcPort string) {
 	// Запуск всех процессов с autostart
 	if err := sv.StartAll(); err != nil {
 		log.Fatalf("[ERROR] Startup failed: %v", err)
 	}
 	log.Println("[INFO] Supervisor started")
+
+	// Запуск gRPC сервера
+	if grpcPort != "" {
+		go func() {
+			log.Printf("Starting gRPC server on :%s", grpcPort)
+			// Передаем интерфейс service.SupervisorService
+			api.StartGRPCServer(service.AsService(sv), grpcPort)
+		}()
+	}
 
 	// Краткая задержка для запуска процессов
 	time.Sleep(500 * time.Millisecond)

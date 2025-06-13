@@ -111,14 +111,16 @@ func (m *Manager) Start(name string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	// Разрешаем запуск только остановленных процессов
 	if p.Status != Stopped && p.Status != Failed {
-		return fmt.Errorf("process already running: %s", name)
+		return fmt.Errorf("process is already running: %s", name)
 	}
 
 	p.Status = Starting
 	p.exitError = nil
+	p.restartCount = 0
+	p.quit = make(chan struct{}) // Создаем новый канал
 	go p.run()
-
 	return nil
 }
 
@@ -154,13 +156,19 @@ func (m *Manager) Stop(name string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	// Разрешаем остановку только активных процессов
 	if p.Status != Running && p.Status != Starting {
-		return nil
+		return fmt.Errorf("process is not running: %s", name)
 	}
 
 	p.Status = Stopping
 	p.restart = false
-	close(p.quit)
+
+	// Закрываем quit канал только если он существует
+	if p.quit != nil {
+		close(p.quit)
+		p.quit = nil
+	}
 	return nil
 }
 
@@ -207,12 +215,14 @@ func (m *Manager) Status() map[string]*ProcessInfo {
 }
 
 func (p *Process) run() {
+	p.log("run() started")
 	defer func() {
+		p.log("run() defer start")
 		p.mu.Lock()
-		if p.Status != Stopping {
-			p.Status = Stopped
-		}
+		p.Status = Stopped
+		p.log("status set to stopped")
 		p.mu.Unlock()
+		p.log("run() defer end")
 	}()
 
 	for {
@@ -299,29 +309,22 @@ func (p *Process) run() {
 
 		select {
 		case <-p.quit:
+			p.logger("[DEBUG] Received stop signal")
 			cancel()
+
 			if p.logger != nil {
-				p.logger(fmt.Sprintf("[INFO] Stopping process: %s (PID: %d)", p.ID, cmd.Process.Pid))
+				p.log(fmt.Sprintf("[INFO] Stopping process: %s (PID: %d)", p.ID, cmd.Process.Pid))
 			}
-			if p.Config.StopSignal == "SIGKILL" {
+
+			// Принудительное завершение по таймауту
+			select {
+			case <-done:
+				p.logger("[DEBUG] Process stopped gracefully")
+			case <-time.After(p.Config.StopWait):
+				p.log("[WARN] Force killing process after timeout")
 				cmd.Process.Kill()
-			} else {
-				// Send interrupt signal and wait with timeout
-				cmd.Process.Signal(os.Interrupt)
-				select {
-				case <-done:
-					if p.logger != nil {
-						p.logger(fmt.Sprintf("[INFO] Process %s stopped gracefully", p.ID))
-					}
-				case <-time.After(p.Config.StopWait):
-					if p.logger != nil {
-						p.logger(fmt.Sprintf("[WARN] Force killing process %s after timeout", p.ID))
-					}
-					cmd.Process.Kill()
-					<-done
-				}
+				<-done
 			}
-			<-done
 			return
 
 		case err := <-done:
@@ -383,5 +386,11 @@ func (p *Process) run() {
 		p.mu.Lock()
 		p.restartCount++
 		p.mu.Unlock()
+	}
+}
+
+func (p *Process) log(message string) {
+	if p.logger != nil {
+		p.logger(fmt.Sprintf("[%s] %s", p.ID, message))
 	}
 }

@@ -1,0 +1,34 @@
+syntax = "proto3";
+
+package gosv;
+option go_package = "github.com/kolkov/gosv/api/gosv";
+
+service Supervisor {
+  rpc StartProcess(ProcessRequest) returns (Response) {}
+  rpc StopProcess(ProcessRequest) returns (Response) {}
+  rpc RestartProcess(ProcessRequest) returns (Response) {}
+  rpc GetStatus(StatusRequest) returns (StatusResponse) {}
+}
+
+message ProcessRequest {
+  string name = 1;
+}
+
+message StatusRequest {}
+
+message Response {
+  bool success = 1;
+  string message = 2;
+}
+
+message ProcessStatus {
+  string name = 1;
+  string status = 2;
+  int32 pid = 3;
+  int32 restarts = 4;
+  string error = 5;
+}
+
+message StatusResponse {
+  repeated ProcessStatus processes = 1;
+}
