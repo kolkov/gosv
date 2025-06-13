@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"sync"
@@ -112,15 +113,30 @@ func (m *Manager) Start(name string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	log.Printf("[DEBUG] Starting process: %s, current status: %s", name, p.Status)
+
 	if p.Status != Stopped && p.Status != Failed {
-		return fmt.Errorf("process already running: %s", name)
+		return fmt.Errorf("process already running: %s, status: %s", name, p.Status)
 	}
 
 	p.Status = Starting
 	p.exitError = nil
+
+	log.Printf("[DEBUG] Launching goroutine for process: %s", name)
 	go p.run()
 
 	return nil
+}
+
+func (m *Manager) StartAll() {
+	for _, p := range m.processes {
+		if p.Config.Autostart {
+			log.Printf("[DEBUG] Autostarting process: %s", p.ID)
+			if err := m.Start(p.ID); err != nil {
+				log.Printf("[ERROR] Failed to autostart process %s: %v", p.ID, err)
+			}
+		}
+	}
 }
 
 func (m *Manager) Stop(name string) error {
@@ -170,6 +186,10 @@ func (m *Manager) Status() map[string]*ProcessInfo {
 }
 
 func (p *Process) run() {
+	// Добавляем отладочное сообщение
+	if p.logger != nil {
+		p.logger(fmt.Sprintf("[DEBUG] Starting goroutine for process: %s", p.ID))
+	}
 	defer func() {
 		p.mu.Lock()
 		if p.Status != Stopping {

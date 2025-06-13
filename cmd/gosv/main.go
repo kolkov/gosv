@@ -41,6 +41,7 @@ func ensureConfigExists(path string) error {
 func main() {
 	cfgPath := flag.String("c", "gsv.yaml", "Path to configuration file")
 	tuiMode := flag.Bool("tui", false, "Enable terminal UI mode")
+	debugMode := flag.Bool("debug", false, "Enable debug logging")
 	flag.Parse()
 
 	// Проверяем и создаем конфиг при необходимости
@@ -57,25 +58,35 @@ func main() {
 	// Инициализация супервизора
 	sv := supervisor.New(cfg)
 
+	// Устанавливаем логгер для отладки
+	if *debugMode {
+		sv.SetLogger(func(log string) {
+			fmt.Println(log)
+		})
+	}
+
 	// Запуск всех процессов с autostart
 	if err := sv.StartAll(); err != nil {
 		log.Fatalf("[ERROR] Startup failed: %v", err)
 	}
 	log.Println("[INFO] Supervisor started")
 
+	// Краткая задержка для запуска процессов
+	time.Sleep(500 * time.Millisecond)
+
+	// Выводим начальный статус
+	sv.PrintStatus()
+
 	// Если включен TUI режим
 	if *tuiMode {
 		// Запускаем TUI интерфейс
-		go sv.RunTUI()
-
-		// Ожидаем сигнала завершения
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-		<-sigCh
+		sv.RunTUI()
 	} else {
 		// Режим без TUI
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+
+		log.Println("Entering signal handling loop. Press Ctrl+C to exit.")
 
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
@@ -89,6 +100,7 @@ func main() {
 					if newCfg, err := config.Load(*cfgPath); err == nil {
 						sv.ReloadConfig(newCfg)
 						log.Println("[INFO] Config reloaded successfully")
+						sv.PrintStatus()
 					} else {
 						log.Printf("[ERROR] Config reload failed: %v", err)
 					}
@@ -99,12 +111,13 @@ func main() {
 					return
 				}
 			case <-ticker.C:
+				log.Println("Periodic status update")
 				sv.PrintStatus()
 			}
 		}
 	}
 
-	// Graceful shutdown
+	// Этот код достижим только если вышли из TUI
 	sv.StopAll()
 	log.Println("[INFO] Supervisor stopped")
 }

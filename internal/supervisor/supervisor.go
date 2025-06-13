@@ -34,8 +34,13 @@ func New(cfg *config.Config) *Supervisor {
 	}
 }
 
-// Устанавливаем логгер для менеджера процессов
-func (s *Supervisor) setLogger() {
+// Добавляем экспортируемый метод SetLogger
+func (s *Supervisor) SetLogger(logger func(string)) {
+	s.manager.SetLogger(logger)
+}
+
+// Изменяем существующий setLogger на SetLogger
+func (s *Supervisor) SetTuiLogger() {
 	s.manager.SetLogger(s.AddLog)
 }
 
@@ -89,8 +94,8 @@ func (s *Supervisor) PrintStatus() {
 func (s *Supervisor) RunTUI() {
 	app := tview.NewApplication()
 
-	// Устанавливаем логгер, который добавляет сообщения в буфер
-	s.setLogger()
+	// Устанавливаем логгер для TUI
+	s.SetTuiLogger()
 
 	// Create process status table
 	table := tview.NewTable().
