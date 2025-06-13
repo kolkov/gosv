@@ -215,14 +215,10 @@ func (m *Manager) Status() map[string]*ProcessInfo {
 }
 
 func (p *Process) run() {
-	p.log("run() started")
 	defer func() {
-		p.log("run() defer start")
 		p.mu.Lock()
 		p.Status = Stopped
-		p.log("status set to stopped")
 		p.mu.Unlock()
-		p.log("run() defer end")
 	}()
 
 	for {
