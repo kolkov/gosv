@@ -5,9 +5,18 @@ processes:
     autostart: true
     autorestart: "always"
     stop_signal: "SIGTERM"
+    stop_wait: 5s
 
   - name: "ping-test"
     command: "ping.exe"
-    args: ["localhost", "-t"]
+    args: ["localhost", "-n", "30"]
     autostart: true
     autorestart: "always"
+
+  - name: "dir-listing"
+    command: "cmd.exe"
+    args: ["/c", "echo Directory listing: && dir && echo Waiting... && timeout /t 30 /nobreak"]
+    autostart: true
+    autorestart: "always"
+    stop_signal: "SIGKILL"
+    stop_wait: 2s

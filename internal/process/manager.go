@@ -23,7 +23,6 @@ const (
 	Failed   Status = "failed"
 )
 
-// Новая структура для информации о процессе
 type ProcessInfo struct {
 	PID       int
 	Status    Status
@@ -116,7 +115,6 @@ func (m *Manager) Stop(name string) error {
 	return nil
 }
 
-// Исправленный метод Status
 func (m *Manager) Status() map[string]*ProcessInfo {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -146,7 +144,6 @@ func (p *Process) run() {
 		if p.Status != Stopping {
 			p.Status = Stopped
 		}
-		fmt.Printf("[INFO] Process %s stopped\n", p.ID)
 		p.mu.Unlock()
 	}()
 
@@ -224,7 +221,16 @@ func (p *Process) run() {
 			if p.Config.StopSignal == "SIGKILL" {
 				cmd.Process.Kill()
 			} else {
+				// Отправляем сигнал прерывания и ждем с таймаутом
 				cmd.Process.Signal(os.Interrupt)
+				select {
+				case <-done:
+					fmt.Printf("[INFO] Process %s stopped gracefully\n", p.ID)
+				case <-time.After(p.Config.StopWait):
+					fmt.Printf("[WARN] Force killing process %s after timeout\n", p.ID)
+					cmd.Process.Kill()
+					<-done
+				}
 			}
 			<-done
 			return
