@@ -1,0 +1,13 @@
+processes:
+  - name: "web-server"
+    command: "python.exe"
+    args: ["-c", "import time; print('Server started'); time.sleep(3600)"]
+    autostart: true
+    autorestart: "always"
+    stop_signal: "SIGTERM"
+
+  - name: "ping-test"
+    command: "ping.exe"
+    args: ["localhost", "-t"]
+    autostart: true
+    autorestart: "always"
