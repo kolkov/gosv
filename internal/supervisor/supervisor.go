@@ -2,9 +2,11 @@ package supervisor
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/fatih/color"
 	"github.com/gdamore/tcell/v2"
 	"github.com/kolkov/gosv/internal/config"
 	"github.com/kolkov/gosv/internal/process"
@@ -34,14 +36,9 @@ func New(cfg *config.Config) *Supervisor {
 	}
 }
 
-// Добавляем экспортируемый метод SetLogger
+// Устанавливаем логгер для менеджера процессов
 func (s *Supervisor) SetLogger(logger func(string)) {
 	s.manager.SetLogger(logger)
-}
-
-// Изменяем существующий setLogger на SetLogger
-func (s *Supervisor) SetTuiLogger() {
-	s.manager.SetLogger(s.AddLog)
 }
 
 // Добавляем лог-сообщение с защитой от гонок
@@ -57,20 +54,27 @@ func (s *Supervisor) AddLog(log string) {
 }
 
 func (s *Supervisor) StartAll() error {
-	for _, pcfg := range s.config.Processes {
-		if pcfg.Autostart {
-			if err := s.manager.Start(pcfg.Name); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
+	return s.manager.StartAll()
+}
+
+func (s *Supervisor) StartProcess(name string) error {
+	return s.manager.Start(name)
 }
 
 func (s *Supervisor) StopAll() {
-	for _, pcfg := range s.config.Processes {
-		s.manager.Stop(pcfg.Name)
+	s.manager.StopAll()
+}
+
+func (s *Supervisor) StopProcess(name string) error {
+	return s.manager.Stop(name)
+}
+
+func (s *Supervisor) RestartProcess(name string) error {
+	if err := s.manager.Stop(name); err != nil {
+		return err
 	}
+	time.Sleep(100 * time.Millisecond) // Краткая задержка
+	return s.manager.Start(name)
 }
 
 func (s *Supervisor) ReloadConfig(newCfg *config.Config) {
@@ -87,15 +91,135 @@ func (s *Supervisor) Status() map[string]*process.ProcessInfo {
 	return s.manager.Status()
 }
 
+func (s *Supervisor) GetProcessStatus(name string) process.Status {
+	statuses := s.manager.Status()
+	if info, ok := statuses[name]; ok {
+		return info.Status
+	}
+	return process.Stopped
+}
+
 func (s *Supervisor) PrintStatus() {
-	// ... (без изменений) ...
+	statuses := s.Status()
+
+	// Create colored printers
+	cyan := color.New(color.FgCyan).SprintFunc()
+	green := color.New(color.FgGreen).SprintFunc()
+	yellow := color.New(color.FgYellow).SprintFunc()
+	red := color.New(color.FgRed).SprintFunc()
+	blue := color.New(color.FgBlue).SprintFunc()
+	magenta := color.New(color.FgMagenta, color.Bold).SprintFunc()
+
+	// Calculate max lengths for alignment
+	maxNameLen := 8
+	maxPidLen := 3
+	for name, info := range statuses {
+		if len(name) > maxNameLen {
+			maxNameLen = len(name)
+		}
+		if info.PID > 0 {
+			pidStr := fmt.Sprintf("%d", info.PID)
+			if len(pidStr) > maxPidLen {
+				maxPidLen = len(pidStr)
+			}
+		}
+	}
+
+	// Format templates
+	nameFormat := fmt.Sprintf("%%-%ds", maxNameLen)
+	pidFormat := fmt.Sprintf("%%-%ds", maxPidLen)
+
+	// Add current time to header
+	currentTime := time.Now().Format("2006-01-02 15:04:05")
+	fmt.Println()
+	fmt.Println(magenta("PROCESS SUPERVISOR STATUS - " + currentTime))
+	fmt.Println(strings.Repeat("-", maxNameLen+maxPidLen+35))
+
+	// Header with Restarts column
+	fmt.Printf(
+		"%s | %s | %-8s | %-8s | %-7s\n",
+		cyan(fmt.Sprintf(nameFormat, "Process")),
+		cyan(fmt.Sprintf(pidFormat, "PID")),
+		cyan("Status"),
+		cyan("Uptime"),
+		cyan("Restarts"),
+	)
+	fmt.Println(strings.Repeat("-", maxNameLen+maxPidLen+35))
+
+	// Process data
+	running := 0
+	failed := 0
+	active := 0
+
+	for name, info := range statuses {
+		pidStr := "N/A"
+		if info.PID > 0 {
+			pidStr = fmt.Sprintf("%d", info.PID)
+		}
+
+		uptime := "N/A"
+		if !info.StartTime.IsZero() {
+			uptime = formatUptime(time.Since(info.StartTime))
+		}
+
+		// Create colored status string
+		var statusStr string
+		switch info.Status {
+		case process.Running:
+			statusStr = green(fmt.Sprintf("%-8s", info.Status))
+			running++
+			active++
+		case process.Starting, process.Stopping:
+			statusStr = yellow(fmt.Sprintf("%-8s", info.Status))
+			active++
+		case process.Failed:
+			statusStr = red(fmt.Sprintf("%-8s", info.Status))
+			failed++
+		case process.Stopped:
+			statusStr = blue(fmt.Sprintf("%-8s", info.Status))
+		default:
+			statusStr = cyan(fmt.Sprintf("%-8s", info.Status))
+		}
+
+		// Highlight restarts when near limit
+		restarts := fmt.Sprintf("%d", info.Restarts)
+		if info.Restarts >= process.MaxRestarts-1 {
+			restarts = yellow(restarts)
+		} else if info.Restarts > 0 {
+			restarts = cyan(restarts)
+		}
+
+		fmt.Printf(
+			"%s | %s | %s | %s | %s\n",
+			fmt.Sprintf(nameFormat, name),
+			fmt.Sprintf(pidFormat, pidStr),
+			statusStr, // Используем цветную строку статуса
+			fmt.Sprintf("%-8s", uptime),
+			fmt.Sprintf("%-7s", restarts),
+		)
+
+		// Show error details for failed processes
+		if info.Status == process.Failed && info.ExitError != nil {
+			fmt.Printf("  └─ %s\n", red(info.ExitError.Error()))
+		}
+	}
+
+	fmt.Println(strings.Repeat("-", maxNameLen+maxPidLen+35))
+	fmt.Printf("Processes: %d | ", len(statuses))
+	green("Running: %d", running)
+	fmt.Print(" | ")
+	red("Failed: %d", failed)
+	fmt.Print(" | ")
+	yellow("Active: %d", active)
+	fmt.Print(" | ")
+	cyan("Max restarts: %d\n\n", process.MaxRestarts)
 }
 
 func (s *Supervisor) RunTUI() {
 	app := tview.NewApplication()
 
 	// Устанавливаем логгер для TUI
-	s.SetTuiLogger()
+	s.SetLogger(s.AddLog)
 
 	// Create process status table
 	table := tview.NewTable().

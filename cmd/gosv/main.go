@@ -6,10 +6,12 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/kolkov/gosv/internal/config"
+	"github.com/kolkov/gosv/internal/process"
 	"github.com/kolkov/gosv/internal/supervisor"
 )
 
@@ -39,12 +41,23 @@ func ensureConfigExists(path string) error {
 }
 
 func main() {
+	// Глобальные флаги
 	cfgPath := flag.String("c", "gsv.yaml", "Path to configuration file")
 	tuiMode := flag.Bool("tui", false, "Enable terminal UI mode")
 	debugMode := flag.Bool("debug", false, "Enable debug logging")
+
+	// Флаги управления процессами
+	startProc := flag.String("start", "", "Start specific process")
+	stopProc := flag.String("stop", "", "Stop specific process")
+	restartProc := flag.String("restart", "", "Restart specific process")
+	runProc := flag.String("run", "", "Run process in foreground mode")
+	listProcs := flag.Bool("list", false, "List all configured processes")
+	status := flag.Bool("status", false, "Show current status")
+	reload := flag.Bool("reload", false, "Reload configuration")
+
 	flag.Parse()
 
-	// Проверяем и создаем конфиг при необходимости
+	// Проверка и создание конфига при необходимости
 	if err := ensureConfigExists(*cfgPath); err != nil {
 		log.Fatalf("[ERROR] %v", err)
 	}
@@ -65,6 +78,124 @@ func main() {
 		})
 	}
 
+	// Обработка команд управления процессами
+	switch {
+	case *listProcs:
+		listAllProcesses(cfg)
+		return
+
+	case *status:
+		sv.PrintStatus()
+		return
+
+	case *reload:
+		handleReload(sv, cfgPath)
+		return
+
+	case *startProc != "":
+		if err := sv.StartProcess(*startProc); err != nil {
+			log.Fatalf("[ERROR] Failed to start process: %v", err)
+		}
+		fmt.Printf("Process '%s' started\n", *startProc)
+		sv.PrintStatus()
+		return
+
+	case *stopProc != "":
+		if err := sv.StopProcess(*stopProc); err != nil {
+			log.Fatalf("[ERROR] Failed to stop process: %v", err)
+		}
+		fmt.Printf("Process '%s' stopped\n", *stopProc)
+		sv.PrintStatus()
+		return
+
+	case *restartProc != "":
+		if err := sv.RestartProcess(*restartProc); err != nil {
+			log.Fatalf("[ERROR] Failed to restart process: %v", err)
+		}
+		fmt.Printf("Process '%s' restarted\n", *restartProc)
+		sv.PrintStatus()
+		return
+
+	case *runProc != "":
+		runProcessForeground(sv, *runProc)
+		return
+	}
+
+	// Стандартный режим работы
+	runSupervisor(sv, tuiMode, cfgPath)
+}
+
+func listAllProcesses(cfg *config.Config) {
+	fmt.Println("\nConfigured processes:")
+	for i, p := range cfg.Processes {
+		fmt.Printf("%d. %s\n", i+1, p.Name)
+		fmt.Printf("   Command: %s %s\n", p.Command, strings.Join(p.Args, " "))
+		fmt.Printf("   Autostart: %v, Autorestart: %s\n", p.Autostart, p.Autorestart)
+		fmt.Println()
+	}
+}
+
+func handleReload(sv *supervisor.Supervisor, cfgPath *string) {
+	fmt.Println("[INFO] Reloading configuration...")
+	newCfg, err := config.Load(*cfgPath)
+	if err != nil {
+		log.Fatalf("[ERROR] Config reload failed: %v", err)
+	}
+	sv.ReloadConfig(newCfg)
+	fmt.Println("[INFO] Configuration reloaded successfully")
+	sv.PrintStatus()
+}
+
+func runProcessForeground(sv *supervisor.Supervisor, procName string) {
+	fmt.Printf("Running process '%s' in foreground...\n", procName)
+
+	// Создаем канал для отслеживания завершения
+	done := make(chan struct{})
+
+	// Специальный логгер для foreground режима
+	sv.SetLogger(func(log string) {
+		if strings.Contains(log, "["+procName+"]") {
+			fmt.Println(log)
+		}
+	})
+
+	// Запускаем процесс
+	if err := sv.StartProcess(procName); err != nil {
+		log.Fatalf("[ERROR] Failed to start process: %v", err)
+	}
+
+	// Обработка сигналов
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	// Ожидаем завершения или сигнала
+	go func() {
+		<-sigCh
+		fmt.Printf("\nStopping process '%s'...\n", procName)
+		sv.StopProcess(procName)
+		close(done)
+	}()
+
+	// Периодическая проверка состояния
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-done:
+			fmt.Println("Process stopped")
+			return
+		case <-ticker.C:
+			status := sv.GetProcessStatus(procName)
+			if status == process.Stopped || status == process.Failed {
+				fmt.Println("Process completed")
+				return
+			}
+		}
+	}
+}
+
+func runSupervisor(sv *supervisor.Supervisor, tuiMode *bool, cfgPath *string) {
 	// Запуск всех процессов с autostart
 	if err := sv.StartAll(); err != nil {
 		log.Fatalf("[ERROR] Startup failed: %v", err)
@@ -86,7 +217,7 @@ func main() {
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 
-		log.Println("Entering signal handling loop. Press Ctrl+C to exit.")
+		log.Println("Entering daemon mode. Press Ctrl+C to exit.")
 
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
@@ -111,7 +242,6 @@ func main() {
 					return
 				}
 			case <-ticker.C:
-				log.Println("Periodic status update")
 				sv.PrintStatus()
 			}
 		}
