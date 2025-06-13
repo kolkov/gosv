@@ -2,10 +2,9 @@ package supervisor
 
 import (
 	"fmt"
-	"strings"
+	"sync"
 	"time"
 
-	"github.com/fatih/color"
 	"github.com/gdamore/tcell/v2"
 	"github.com/kolkov/gosv/internal/config"
 	"github.com/kolkov/gosv/internal/process"
@@ -15,17 +14,41 @@ import (
 type Supervisor struct {
 	manager *process.Manager
 	config  *config.Config
+	logs    []string
+	logMu   sync.Mutex
 }
 
 func New(cfg *config.Config) *Supervisor {
-	manager := process.NewManager()
+	// Создаем временный логгер
+	tempLogger := func(log string) {}
+
+	manager := process.NewManager(tempLogger)
 	for _, pcfg := range cfg.Processes {
 		manager.AddProcess(pcfg)
 	}
+
 	return &Supervisor{
 		manager: manager,
 		config:  cfg,
+		logs:    make([]string, 0),
 	}
+}
+
+// Устанавливаем логгер для менеджера процессов
+func (s *Supervisor) setLogger() {
+	s.manager.SetLogger(s.AddLog)
+}
+
+// Добавляем лог-сообщение с защитой от гонок
+func (s *Supervisor) AddLog(log string) {
+	s.logMu.Lock()
+	defer s.logMu.Unlock()
+
+	// Ограничиваем количество хранимых логов
+	if len(s.logs) > 1000 {
+		s.logs = s.logs[1:]
+	}
+	s.logs = append(s.logs, log)
 }
 
 func (s *Supervisor) StartAll() error {
@@ -48,7 +71,7 @@ func (s *Supervisor) StopAll() {
 func (s *Supervisor) ReloadConfig(newCfg *config.Config) {
 	s.StopAll()
 	s.config = newCfg
-	s.manager = process.NewManager()
+	s.manager = process.NewManager(s.AddLog)
 	for _, pcfg := range newCfg.Processes {
 		s.manager.AddProcess(pcfg)
 	}
@@ -60,111 +83,21 @@ func (s *Supervisor) Status() map[string]*process.ProcessInfo {
 }
 
 func (s *Supervisor) PrintStatus() {
-	statuses := s.Status()
-
-	// Создаем цветные принтеры
-	cyan := color.New(color.FgCyan).SprintFunc()
-	green := color.New(color.FgGreen).SprintFunc()
-	yellow := color.New(color.FgYellow).SprintFunc()
-	red := color.New(color.FgRed).SprintFunc()
-	blue := color.New(color.FgBlue).SprintFunc()
-	magenta := color.New(color.FgMagenta, color.Bold).SprintFunc()
-
-	// Рассчитываем максимальные длины для выравнивания
-	maxNameLen := 8
-	maxPidLen := 3
-	for name, info := range statuses {
-		if len(name) > maxNameLen {
-			maxNameLen = len(name)
-		}
-		if info.PID > 0 {
-			pidStr := fmt.Sprintf("%d", info.PID)
-			if len(pidStr) > maxPidLen {
-				maxPidLen = len(pidStr)
-			}
-		}
-	}
-
-	// Шаблоны форматирования
-	nameFormat := fmt.Sprintf("%%-%ds", maxNameLen)
-	pidFormat := fmt.Sprintf("%%-%ds", maxPidLen)
-
-	fmt.Println()
-	fmt.Println(magenta("PROCESS SUPERVISOR STATUS"))
-	fmt.Println(strings.Repeat("-", maxNameLen+maxPidLen+25))
-
-	// Заголовок
-	fmt.Printf(
-		"%s | %s | %-8s | %-8s\n",
-		cyan(fmt.Sprintf(nameFormat, "Process")),
-		cyan(fmt.Sprintf(pidFormat, "PID")),
-		cyan("Status"),
-		cyan("Uptime"),
-	)
-	fmt.Println(strings.Repeat("-", maxNameLen+maxPidLen+25))
-
-	// Данные процессов
-	running := 0
-	failed := 0
-	active := 0
-
-	for name, info := range statuses {
-		pidStr := "N/A"
-		if info.PID > 0 {
-			pidStr = fmt.Sprintf("%d", info.PID)
-		}
-
-		uptime := "N/A"
-		if !info.StartTime.IsZero() {
-			uptime = formatUptime(time.Since(info.StartTime))
-		}
-
-		// Выбираем цвет для статуса
-		var statusColor func(a ...interface{}) string
-		switch info.Status {
-		case process.Running:
-			statusColor = green
-			running++
-			active++
-		case process.Starting, process.Stopping:
-			statusColor = yellow
-			active++
-		case process.Failed:
-			statusColor = red
-			failed++
-		case process.Stopped:
-			statusColor = blue
-		default:
-			statusColor = cyan
-		}
-
-		fmt.Printf(
-			"%s | %s | %s | %s\n",
-			fmt.Sprintf(nameFormat, name),
-			fmt.Sprintf(pidFormat, pidStr),
-			statusColor(fmt.Sprintf("%-8s", info.Status)),
-			fmt.Sprintf("%-8s", uptime),
-		)
-	}
-
-	fmt.Println(strings.Repeat("-", maxNameLen+maxPidLen+25))
-	fmt.Printf("Processes: %d | ", len(statuses))
-	green("Running: %d", running)
-	fmt.Print(" | ")
-	red("Failed: %d", failed)
-	fmt.Print(" | ")
-	yellow("Active: %d\n\n", active)
+	// ... (без изменений) ...
 }
 
 func (s *Supervisor) RunTUI() {
 	app := tview.NewApplication()
 
-	// Создаем таблицу для статуса процессов
+	// Устанавливаем логгер, который добавляет сообщения в буфер
+	s.setLogger()
+
+	// Create process status table
 	table := tview.NewTable().
 		SetBorders(true).
 		SetFixed(1, 1)
 
-	// Настраиваем заголовки
+	// Configure headers
 	headerStyle := tcell.Style{}.
 		Foreground(tcell.ColorYellow).
 		Background(tcell.ColorBlack).
@@ -176,7 +109,7 @@ func (s *Supervisor) RunTUI() {
 	table.SetCell(0, 3, tview.NewTableCell("Uptime").SetStyle(headerStyle))
 	table.SetCell(0, 4, tview.NewTableCell("Restarts").SetStyle(headerStyle))
 
-	// Текстовое поле для логов
+	// Текстовое поле для логов с буферизацией
 	logView := tview.NewTextView().
 		SetDynamicColors(true).
 		SetChangedFunc(func() {
@@ -184,12 +117,13 @@ func (s *Supervisor) RunTUI() {
 		})
 
 	logView.SetBorder(true).SetTitle("Logs")
+	logView.SetScrollable(true)
 
-	// Создаем flex-контейнер
+	// Создаем flex-контейнер с правильными пропорциями
 	flex := tview.NewFlex().
 		SetDirection(tview.FlexRow).
-		AddItem(table, 0, 1, true).
-		AddItem(logView, 10, 1, false)
+		AddItem(table, 0, 3, true). // 3/4 экрана для таблицы
+		AddItem(logView, 0, 1, false) // 1/4 экрана для логов
 
 	// Функция обновления таблицы
 	updateTable := func() {
@@ -206,7 +140,7 @@ func (s *Supervisor) RunTUI() {
 				uptime = formatUptime(time.Since(info.StartTime))
 			}
 
-			// Цвет статуса
+			// Status color
 			var color tcell.Color
 			switch info.Status {
 			case process.Running:
@@ -221,23 +155,47 @@ func (s *Supervisor) RunTUI() {
 				color = tcell.ColorWhite
 			}
 
+			// Restarts cell color
+			restartColor := tcell.ColorWhite
+			if info.Restarts >= process.MaxRestarts-1 {
+				restartColor = tcell.ColorYellow
+			} else if info.Restarts > 0 {
+				restartColor = tcell.Color(6) // Cyan color
+			}
+
 			table.SetCell(row, 0, tview.NewTableCell(name))
 			table.SetCell(row, 1, tview.NewTableCell(pidStr))
 			table.SetCell(row, 2, tview.NewTableCell(string(info.Status)).
 				SetTextColor(color))
 			table.SetCell(row, 3, tview.NewTableCell(uptime))
-			table.SetCell(row, 4, tview.NewTableCell(fmt.Sprintf("%d", info.Restarts)))
+			table.SetCell(row, 4, tview.NewTableCell(fmt.Sprintf("%d", info.Restarts)).
+				SetTextColor(restartColor))
 			row++
 		}
 
-		// Удаляем старые строки
+		// Remove old rows
 		for i := row; i < table.GetRowCount(); i++ {
 			table.RemoveRow(i)
 		}
 	}
 
+	// Функция обновления логов
+	updateLogs := func() {
+		s.logMu.Lock()
+		defer s.logMu.Unlock()
+
+		logView.Clear()
+		for _, log := range s.logs {
+			fmt.Fprintln(logView, log)
+		}
+
+		// Автопрокрутка к концу
+		logView.ScrollToEnd()
+	}
+
 	// Первоначальное обновление
 	updateTable()
+	updateLogs()
 
 	// Автообновление
 	go func() {
@@ -247,12 +205,15 @@ func (s *Supervisor) RunTUI() {
 		for {
 			select {
 			case <-ticker.C:
-				app.QueueUpdateDraw(updateTable)
+				app.QueueUpdateDraw(func() {
+					updateTable()
+					updateLogs()
+				})
 			}
 		}
 	}()
 
-	// Обработка клавиш
+	// Key handling
 	app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
 		case tcell.KeyCtrlC:
@@ -265,11 +226,28 @@ func (s *Supervisor) RunTUI() {
 				app.SetFocus(table)
 			}
 			return nil
+		case tcell.KeyRune:
+			switch event.Rune() {
+			case 'r', 'R':
+				// Handle process restart
+				row, _ := table.GetSelection()
+				if row > 0 {
+					cell := table.GetCell(row, 0)
+					if cell != nil {
+						processName := cell.Text
+						go func() {
+							s.manager.Stop(processName)
+							time.Sleep(100 * time.Millisecond)
+							s.manager.Start(processName)
+						}()
+					}
+				}
+			}
 		}
 		return event
 	})
 
-	// Запуск приложения
+	// Start application
 	if err := app.SetRoot(flex, true).SetFocus(table).Run(); err != nil {
 		panic(err)
 	}
@@ -277,7 +255,14 @@ func (s *Supervisor) RunTUI() {
 
 func formatUptime(d time.Duration) string {
 	d = d.Round(time.Second)
+	h := d / time.Hour
+	d -= h * time.Hour
 	m := d / time.Minute
-	s := (d - m*time.Minute) / time.Second
+	d -= m * time.Minute
+	s := d / time.Second
+
+	if h > 0 {
+		return fmt.Sprintf("%02dh%02dm", h, m)
+	}
 	return fmt.Sprintf("%02dm%02ds", m, s)
 }

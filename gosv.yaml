@@ -1,7 +1,9 @@
 processes:
   - name: "web-server"
     command: "python.exe"
-    args: ["-c", "import time; print('Server started'); time.sleep(3600)"]
+    args:
+      - "-c"
+      - "import time; print('Server started'); time.sleep(3600)"
     autostart: true
     autorestart: "always"
     stop_signal: "SIGTERM"
@@ -9,13 +11,19 @@ processes:
 
   - name: "ping-test"
     command: "ping.exe"
-    args: ["localhost", "-n", "30"]
+    args:
+      - "localhost"
+      - "-n"
+      - "30"
     autostart: true
     autorestart: "always"
+    stop_wait: 3s
 
   - name: "dir-listing"
     command: "cmd.exe"
-    args: ["/c", "echo Directory listing: && dir && echo Waiting... && timeout /t 30 /nobreak"]
+    args:
+      - "/c"
+      - "echo Directory listing: && dir && echo Waiting... && ping 127.0.0.1 -n 30 > nul"
     autostart: true
     autorestart: "always"
     stop_signal: "SIGKILL"

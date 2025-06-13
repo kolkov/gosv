@@ -23,11 +23,18 @@ const (
 	Failed   Status = "failed"
 )
 
+const (
+	MaxRestarts         = 5
+	InitialRestartDelay = 1 * time.Second
+	MaxRestartDelay     = 30 * time.Second
+)
+
 type ProcessInfo struct {
 	PID       int
 	Status    Status
 	StartTime time.Time
 	Restarts  int
+	ExitError error
 }
 
 type Process struct {
@@ -40,16 +47,36 @@ type Process struct {
 	mu           sync.Mutex
 	startTime    time.Time
 	restartCount int
+	restartDelay time.Duration
+	exitError    error
+	logger       func(string) // Функция для логирования
 }
 
 type Manager struct {
 	processes map[string]*Process
 	mu        sync.RWMutex
+	logger    func(string) // Общий логгер
 }
 
-func NewManager() *Manager {
+func NewManager(logger func(string)) *Manager {
 	return &Manager{
 		processes: make(map[string]*Process),
+		logger:    logger,
+	}
+}
+
+// Добавляем метод для установки логгера
+func (m *Manager) SetLogger(logger func(string)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.logger = logger
+
+	// Обновляем логгеры для всех процессов
+	for _, proc := range m.processes {
+		proc.mu.Lock()
+		proc.logger = logger
+		proc.mu.Unlock()
 	}
 }
 
@@ -58,10 +85,12 @@ func (m *Manager) AddProcess(cfg config.ProcessConfig) {
 	defer m.mu.Unlock()
 
 	p := &Process{
-		ID:     cfg.Name,
-		Config: cfg,
-		Status: Stopped,
-		quit:   make(chan struct{}),
+		ID:           cfg.Name,
+		Config:       cfg,
+		Status:       Stopped,
+		quit:         make(chan struct{}),
+		restartDelay: InitialRestartDelay,
+		logger:       m.logger, // Используем общий логгер
 	}
 
 	if cfg.Autorestart == "always" {
@@ -88,6 +117,7 @@ func (m *Manager) Start(name string) error {
 	}
 
 	p.Status = Starting
+	p.exitError = nil
 	go p.run()
 
 	return nil
@@ -105,7 +135,7 @@ func (m *Manager) Stop(name string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if p.Status != Running {
+	if p.Status != Running && p.Status != Starting {
 		return nil
 	}
 
@@ -126,6 +156,7 @@ func (m *Manager) Status() map[string]*ProcessInfo {
 			Status:    proc.Status,
 			StartTime: proc.startTime,
 			Restarts:  proc.restartCount,
+			ExitError: proc.exitError,
 		}
 
 		if proc.Cmd != nil && proc.Cmd.Process != nil {
@@ -150,11 +181,15 @@ func (p *Process) run() {
 	for {
 		p.mu.Lock()
 		p.Status = Starting
-		p.restartCount++
 		p.startTime = time.Now()
 		p.mu.Unlock()
 
-		fmt.Printf("[INFO] Starting process: %s %v\n", p.Config.Command, p.Config.Args)
+		// Reset restart delay for new runs
+		p.restartDelay = InitialRestartDelay
+
+		if p.logger != nil {
+			p.logger(fmt.Sprintf("[INFO] Starting process: %s %v", p.Config.Command, p.Config.Args))
+		}
 
 		ctx, cancel := context.WithCancel(context.Background())
 		cmd := exec.CommandContext(ctx, p.Config.Command, p.Config.Args...)
@@ -171,7 +206,7 @@ func (p *Process) run() {
 			cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
 		}
 
-		// Создаем каналы для вывода
+		// Create output pipes
 		stdout, _ := cmd.StdoutPipe()
 		stderr, _ := cmd.StderrPipe()
 
@@ -179,33 +214,44 @@ func (p *Process) run() {
 		p.Cmd = cmd
 		p.mu.Unlock()
 
-		// Запускаем процесс
+		// Start the process
 		if err := cmd.Start(); err != nil {
 			p.mu.Lock()
 			p.Status = Failed
+			p.exitError = fmt.Errorf("start failed: %w", err)
 			p.mu.Unlock()
-			fmt.Printf("[ERROR] Process %s failed to start: %v\n", p.ID, err)
+			if p.logger != nil {
+				p.logger(fmt.Sprintf("[ERROR] Process %s failed to start: %v", p.ID, err))
+			}
 			return
 		}
 
-		fmt.Printf("[INFO] Process %s started with PID: %d\n", p.ID, cmd.Process.Pid)
+		if p.logger != nil {
+			p.logger(fmt.Sprintf("[INFO] Process %s started with PID: %d", p.ID, cmd.Process.Pid))
+		}
 
 		p.mu.Lock()
 		p.Status = Running
 		p.mu.Unlock()
 
-		// Чтение вывода в реальном времени
+		// Real-time output handling
 		go func() {
 			scanner := bufio.NewScanner(stdout)
 			for scanner.Scan() {
-				fmt.Printf("[%s][%d] %s\n", p.ID, cmd.Process.Pid, scanner.Text())
+				log := fmt.Sprintf("[%s][%d] %s", p.ID, cmd.Process.Pid, scanner.Text())
+				if p.logger != nil {
+					p.logger(log)
+				}
 			}
 		}()
 
 		go func() {
 			scanner := bufio.NewScanner(stderr)
 			for scanner.Scan() {
-				fmt.Printf("[%s][%d][ERROR] %s\n", p.ID, cmd.Process.Pid, scanner.Text())
+				log := fmt.Sprintf("[%s][%d][ERROR] %s", p.ID, cmd.Process.Pid, scanner.Text())
+				if p.logger != nil {
+					p.logger(log)
+				}
 			}
 		}()
 
@@ -217,17 +263,23 @@ func (p *Process) run() {
 		select {
 		case <-p.quit:
 			cancel()
-			fmt.Printf("[INFO] Stopping process: %s (PID: %d)\n", p.ID, cmd.Process.Pid)
+			if p.logger != nil {
+				p.logger(fmt.Sprintf("[INFO] Stopping process: %s (PID: %d)", p.ID, cmd.Process.Pid))
+			}
 			if p.Config.StopSignal == "SIGKILL" {
 				cmd.Process.Kill()
 			} else {
-				// Отправляем сигнал прерывания и ждем с таймаутом
+				// Send interrupt signal and wait with timeout
 				cmd.Process.Signal(os.Interrupt)
 				select {
 				case <-done:
-					fmt.Printf("[INFO] Process %s stopped gracefully\n", p.ID)
+					if p.logger != nil {
+						p.logger(fmt.Sprintf("[INFO] Process %s stopped gracefully", p.ID))
+					}
 				case <-time.After(p.Config.StopWait):
-					fmt.Printf("[WARN] Force killing process %s after timeout\n", p.ID)
+					if p.logger != nil {
+						p.logger(fmt.Sprintf("[WARN] Force killing process %s after timeout", p.ID))
+					}
 					cmd.Process.Kill()
 					<-done
 				}
@@ -237,28 +289,62 @@ func (p *Process) run() {
 
 		case err := <-done:
 			cancel()
+			p.mu.Lock()
 			if err != nil {
-				p.mu.Lock()
 				p.Status = Failed
-				p.mu.Unlock()
-				fmt.Printf("[ERROR] Process %s (PID: %d) exited with error: %v\n", p.ID, cmd.Process.Pid, err)
+				p.exitError = fmt.Errorf("exit error: %w", err)
+				if p.logger != nil {
+					p.logger(fmt.Sprintf("[ERROR] Process %s (PID: %d) exited with error: %v", p.ID, cmd.Process.Pid, err))
+				}
 			} else {
-				p.mu.Lock()
 				p.Status = Stopped
-				p.mu.Unlock()
-				fmt.Printf("[INFO] Process %s (PID: %d) exited normally\n", p.ID, cmd.Process.Pid)
+				if p.logger != nil {
+					p.logger(fmt.Sprintf("[INFO] Process %s (PID: %d) exited normally", p.ID, cmd.Process.Pid))
+				}
 			}
+			p.mu.Unlock()
 		}
 
-		if !p.restart {
+		p.mu.Lock()
+		currentRestart := p.restart
+		currentRestartCount := p.restartCount
+		p.mu.Unlock()
+
+		if !currentRestart {
 			return
 		}
 
-		fmt.Printf("[INFO] Restarting process: %s\n", p.ID)
+		// Check restart limits
+		if currentRestartCount >= MaxRestarts {
+			p.mu.Lock()
+			p.Status = Failed
+			p.restart = false
+			if p.logger != nil {
+				p.logger(fmt.Sprintf("[WARN] Process %s reached max restarts (%d), stopping", p.ID, MaxRestarts))
+			}
+			p.mu.Unlock()
+			return
+		}
+
+		// Increase restart delay exponentially
+		p.restartDelay = time.Duration(float64(p.restartDelay) * 1.5)
+		if p.restartDelay > MaxRestartDelay {
+			p.restartDelay = MaxRestartDelay
+		}
+
+		if p.logger != nil {
+			p.logger(fmt.Sprintf("[INFO] Restarting process: %s in %v (attempt %d/%d)",
+				p.ID, p.restartDelay.Round(time.Millisecond), currentRestartCount+1, MaxRestarts))
+		}
+
 		select {
 		case <-p.quit:
 			return
-		case <-time.After(1 * time.Second):
+		case <-time.After(p.restartDelay):
 		}
+
+		p.mu.Lock()
+		p.restartCount++
+		p.mu.Unlock()
 	}
 }
